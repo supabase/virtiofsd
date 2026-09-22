@@ -36,7 +36,7 @@ impl UnixCredentials {
 
     /// Changes the effective uid/gid of the current thread to `val`.  Changes
     /// the thread's credentials back to root when the returned struct is dropped.
-    pub fn set(self) -> io::Result<Option<UnixCredentialsGuard>> {
+    pub fn set(self) -> io::Result<UnixCredentialsGuard> {
         // Safe: Always succesful
         let current_uid = HostUid::from(unsafe { libc::geteuid() });
         let current_gid = HostGid::from(unsafe { libc::getegid() });
@@ -49,17 +49,13 @@ impl UnixCredentials {
         // We have to change the gid before we change the uid because if we
         // change the uid first then we lose the capability to change the gid.
         // However changing back can happen in any order.
-        if !self.sup_gids.is_empty() {
-            oslib::setsupgroup(&self.sup_gids)?;
-        }
-
-        if change_gid {
-            oslib::seteffgid(self.gid)?;
-        }
-
-        if change_uid {
-            oslib::seteffuid(self.uid)?;
-        }
+        let sup_guard = ScopedSupGids::new(&self.sup_gids)?;
+        let gid_guard = change_gid
+            .then(|| ScopedGid::new(current_gid, self.gid))
+            .transpose()?;
+        let uid_guard = change_uid
+            .then(|| ScopedUid::new(current_uid, self.uid))
+            .transpose()?;
 
         if change_uid && self.keep_capability {
             // Before kernel 6.3, we don't have access to process supplementary groups.
@@ -73,44 +69,63 @@ impl UnixCredentials {
             }
         }
 
-        if !change_uid && !change_gid {
+        Ok(UnixCredentialsGuard {
+            _uid: uid_guard,
+            _gid: gid_guard,
+            _sup_gids: sup_guard,
+        })
+    }
+}
+
+macro_rules! scoped_id {
+    ($name:ident, $id_type:ty, $set_fn:path, $label:literal) => {
+        struct $name($id_type);
+
+        impl $name {
+            fn new(current: $id_type, target: $id_type) -> io::Result<Self> {
+                $set_fn(target)?;
+                Ok($name(current))
+            }
+        }
+
+        impl Drop for $name {
+            fn drop(&mut self) {
+                $set_fn(self.0).unwrap_or_else(|e| {
+                    error!("failed to change {} back to {}: {e}", $label, self.0);
+                });
+            }
+        }
+    };
+}
+
+scoped_id!(ScopedUid, HostUid, oslib::seteffuid, "uid");
+scoped_id!(ScopedGid, HostGid, oslib::seteffgid, "gid");
+
+struct ScopedSupGids;
+
+impl ScopedSupGids {
+    fn new(gids: &[HostGid]) -> io::Result<Option<Self>> {
+        if gids.is_empty() {
             return Ok(None);
         }
-
-        Ok(Some(UnixCredentialsGuard {
-            reset_uid: change_uid.then_some(current_uid),
-            reset_gid: change_gid.then_some(current_gid),
-            drop_sup_gid: !self.sup_gids.is_empty(),
-        }))
+        oslib::setsupgroup(gids)?;
+        Ok(Some(ScopedSupGids))
     }
 }
 
-pub struct UnixCredentialsGuard {
-    reset_uid: Option<HostUid>,
-    reset_gid: Option<HostGid>,
-    drop_sup_gid: bool,
-}
-
-impl Drop for UnixCredentialsGuard {
+impl Drop for ScopedSupGids {
     fn drop(&mut self) {
-        if let Some(uid) = self.reset_uid {
-            oslib::seteffuid(uid).unwrap_or_else(|e| {
-                error!("failed to change uid back to {uid}: {e}");
-            });
-        }
-
-        if let Some(gid) = self.reset_gid {
-            oslib::seteffgid(gid).unwrap_or_else(|e| {
-                error!("failed to change gid back to {gid}: {e}");
-            });
-        }
-
-        if self.drop_sup_gid {
-            oslib::dropsupgroups().unwrap_or_else(|e| {
-                error!("failed to drop supplementary groups: {e}");
-            });
-        }
+        oslib::dropsupgroups().unwrap_or_else(|e| {
+            error!("failed to drop supplementary groups: {e}");
+        });
     }
+}
+
+// Dropped in declaration order
+pub struct UnixCredentialsGuard {
+    _uid: Option<ScopedUid>,
+    _gid: Option<ScopedGid>,
+    _sup_gids: Option<ScopedSupGids>,
 }
 
 pub struct ScopedCaps {

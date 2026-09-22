@@ -1538,7 +1538,7 @@ impl PassthroughFs {
         &self,
         ctx: &Context,
         extensions: &Extensions,
-    ) -> io::Result<Option<UnixCredentialsGuard>> {
+    ) -> io::Result<UnixCredentialsGuard> {
         let host_uid = self.map_guest_uid(ctx.uid)?;
         let host_gid = self.map_guest_gid(ctx.gid)?;
         let supp_gids = extensions
