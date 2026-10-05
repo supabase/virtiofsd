@@ -65,6 +65,62 @@ fn should_clear_sgid_for_setxattr(
         && name.to_bytes() == POSIX_ACL_ACCESS_XATTR
 }
 
+/// Returns the host name under which guest POSIX access ACLs are stored if `--xattrmap` renames
+/// `system.posix_acl_access`, i.e. if the host filesystem stores guest ACLs as opaque xattrs
+/// instead of interpreting them.  Returns `None` if the name is passed through unchanged (the host
+/// filesystem then enforces the ACL itself), or if the mapping rejects it.
+fn remapped_posix_acl_access_xattr(xattrmap: Option<&XattrMap>) -> Option<CString> {
+    let name = CStr::from_bytes_with_nul(b"system.posix_acl_access\0").unwrap();
+    match xattrmap?.map_client_xattr(name).ok()? {
+        AppliedRule::Pass(host_name) if host_name.as_ref() != name => Some(host_name.into_owned()),
+        _ => None,
+    }
+}
+
+/// Computes the gid a new entry created on the `posix_acl_create_fallback` path must get, i.e.
+/// the one creating it with the caller's credentials would have given it (`inode_init_owner()`):
+/// the parent directory's gid if the parent has `S_ISGID` set, the caller's gid otherwise.
+fn fallback_entry_gid(
+    caller_gid: libc::gid_t,
+    parent_mode: libc::mode_t,
+    parent_gid: libc::gid_t,
+) -> libc::gid_t {
+    if parent_mode & libc::S_ISGID != 0 {
+        parent_gid
+    } else {
+        caller_gid
+    }
+}
+
+/// Computes the permission bits a new entry created on the `posix_acl_create_fallback` path must
+/// end up with, i.e. the ones creating it with the caller's credentials would have given it.
+/// `mode` is the requested mode (including the file type), with the umask already applied.
+///
+/// Like `vfs_mkdir()` and `inode_init_owner()`, directories never get `S_ISUID`, and inherit
+/// `S_ISGID` from the parent.  Like `mode_strip_sgid()`, other entries lose `S_ISGID` in an
+/// `S_ISGID` parent of a group the caller is not a member of.
+fn fallback_entry_mode(
+    mode: libc::mode_t,
+    parent_mode: libc::mode_t,
+    caller_in_parent_group: bool,
+) -> libc::mode_t {
+    let perm = mode & 0o7777;
+    let parent_sgid = parent_mode & libc::S_ISGID != 0;
+    let sgid_exec = libc::S_ISGID | libc::S_IXGRP;
+    if mode & libc::S_IFMT == libc::S_IFDIR {
+        let perm = perm & 0o1777;
+        if parent_sgid {
+            perm | libc::S_ISGID
+        } else {
+            perm
+        }
+    } else if parent_sgid && perm & sgid_exec == sgid_exec && !caller_in_parent_group {
+        perm & !libc::S_ISGID
+    } else {
+        perm
+    }
+}
+
 enum HandleDataFile {
     File(RwLock<GuestFile>),
     // `io::Error` does not implement `Clone`, so without wrapping it in `Arc`, returning the error
@@ -383,6 +439,16 @@ pub struct Config {
     /// setuid and setgid bits.
     pub killpriv_v2: bool,
 
+    /// If the host filesystem denies a create with the caller's credentials (with `EACCES`), retry
+    /// it with the daemon's credentials, if the parent directory has a POSIX access ACL that
+    /// `xattrmap` stores as an opaque xattr (and that the host filesystem thus does not enforce).  The new entry is then given the
+    /// owner, group and mode creating it with the caller's credentials would have given it.
+    ///
+    /// Requires `posix_acl` not to be `Never`, and `xattrmap` to rename `system.posix_acl_access`.
+    ///
+    /// The default is `false`.
+    pub posix_acl_create_fallback: bool,
+
     /// Enable support for posix ACLs
     ///
     /// The default is `Never`.
@@ -469,6 +535,7 @@ impl Default for Config {
             inode_file_handles: Default::default(),
             readdirplus: true,
             allow_direct_io: false,
+            posix_acl_create_fallback: false,
             killpriv_v2: false,
             posix_acl: NegotiationMode::Never,
             security_label: NegotiationMode::Never,
@@ -539,6 +606,10 @@ pub struct PassthroughFs {
     // Whether the guest kernel supports the supplementary group extension.
     sup_group_extension: AtomicBool,
 
+    // Host name of the remapped `system.posix_acl_access` xattr if `posix_acl_create_fallback` is
+    // enabled, `None` otherwise.
+    create_fallback_acl_xattr: Option<CString>,
+
     // Whether we are preparing for migration and need to track changes to inodes like renames.  We
     // should then also make sure newly created inodes immediately have their migration info set.
     track_migration_info: AtomicBool,
@@ -599,6 +670,25 @@ impl PassthroughFs {
             IdMap::empty()
         };
 
+        let create_fallback_acl_xattr = if cfg.posix_acl_create_fallback {
+            if cfg.posix_acl == NegotiationMode::Never {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "--posix-acl-create-fallback requires --posix-acl",
+                ));
+            }
+            let name = remapped_posix_acl_access_xattr(cfg.xattrmap.as_ref()).ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "--posix-acl-create-fallback requires --xattrmap to remap \
+                     system.posix_acl_access",
+                )
+            })?;
+            Some(name)
+        } else {
+            None
+        };
+
         let mut fs = PassthroughFs {
             inodes: Default::default(),
             next_inode: AtomicU64::new(fuse::ROOT_ID + 1),
@@ -612,6 +702,7 @@ impl PassthroughFs {
             announce_submounts: AtomicBool::new(false),
             posix_acl: AtomicBool::new(false),
             sup_group_extension: AtomicBool::new(false),
+            create_fallback_acl_xattr,
             os_facts: oslib::OsFacts::new(),
             track_migration_info: AtomicBool::new(false),
             cfg,
@@ -1220,6 +1311,232 @@ impl PassthroughFs {
         }
     }
 
+    /// Runs `op`, a create/mkdir/mknod/symlink of `name` in `parent_file`, with the caller's
+    /// credentials, as usual.  If the host filesystem denies it, retries it with
+    /// the daemon's credentials if `may_retry_create_as_daemon()` allows it (see
+    /// `Config::posix_acl_create_fallback`).
+    ///
+    /// `op` must perform the same syscall on both attempts, and capture `errno` right after it.
+    /// It is passed a mask to apply to the mode it creates the entry with: the retry creates the
+    /// entry without any permission bits, so it is not accessible to anyone but the daemon until
+    /// `fix_up_fallback_entry()` has given it its owner and mode.
+    ///
+    /// Returns `op`'s result, and whether it was the retry that succeeded.  In that case, the
+    /// caller must call `fix_up_fallback_entry()` on the new entry.
+    fn create_or_retry_as_daemon<T>(
+        &self,
+        ctx: &Context,
+        extensions: &Extensions,
+        parent_file: &InodeFile,
+        name: &CStr,
+        op: impl Fn(libc::mode_t) -> io::Result<T>,
+    ) -> io::Result<(T, bool)> {
+        let guard = self.unix_credentials_guard(ctx, extensions)?;
+        let err = match op(!0) {
+            Ok(v) => return Ok((v, false)),
+            Err(e) => e,
+        };
+        // Check the parent's ACL with the daemon's credentials: the caller may well not be allowed
+        // to read the parent's xattrs on the host either.
+        drop(guard);
+
+        if !self.may_retry_create_as_daemon(ctx, parent_file, &err) {
+            return Err(err);
+        }
+        debug!(
+            "Host denied creating {name:?} as uid {}, but the parent has a POSIX ACL: \
+             retrying with daemon credentials",
+            ctx.uid
+        );
+        op(libc::S_IFMT).map(|v| (v, true))
+    }
+
+    /// Whether a create in `parent_file` that the host filesystem denied with `err` may be retried
+    /// with the daemon's credentials.  The guest kernel has already checked the caller's
+    /// permissions (including the parent's POSIX ACL), so this only needs to make sure the denial
+    /// may be explained by the host not seeing that ACL.
+    fn may_retry_create_as_daemon(
+        &self,
+        ctx: &Context,
+        parent_file: &InodeFile,
+        err: &io::Error,
+    ) -> bool {
+        let acl_xattr = match &self.create_fallback_acl_xattr {
+            Some(acl_xattr) => acl_xattr,
+            None => return false,
+        };
+
+        err.raw_os_error() == Some(libc::EACCES)
+            && self.posix_acl.load(Ordering::Relaxed)
+            // `UnixCredentials::set()` keeps root's uid for root callers, so a retry would fail
+            // just the same.
+            && self.map_guest_uid(ctx.uid).is_ok_and(|uid| !uid.is_root())
+            && self.has_xattr(parent_file, acl_xattr)
+    }
+
+    /// Whether `file` (possibly an `O_PATH` fd) has a non-empty xattr `name` (a host name).
+    fn has_xattr(&self, file: &impl AsRawFd, name: &CStr) -> bool {
+        // `getxattr()` does not work on `O_PATH` fds, so go through /proc/self/fd, like
+        // `getxattr()` does.
+        let procname = match CString::new(format!("{}", file.as_raw_fd())) {
+            Ok(procname) => procname,
+            Err(_) => return false,
+        };
+        let _working_dir_guard = self.switch_to_proc_self_fd();
+
+        // Safe because this doesn't modify any memory: we only query the value's size.
+        let res =
+            unsafe { libc::getxattr(procname.as_ptr(), name.as_ptr(), std::ptr::null_mut(), 0) };
+        res > 0
+    }
+
+    /// Gives an entry that `create_or_retry_as_daemon()` created with the daemon's credentials the
+    /// owner, group and mode creating it with the caller's credentials would have given it.  If
+    /// that fails, the entry is removed again.
+    ///
+    /// `mode` is the requested mode (including the file type), with the umask already applied.
+    /// `created` is an fd for the new entry if the create returned one (`do_create()`).
+    /// Otherwise, `name` is opened with `O_PATH | O_NOFOLLOW`, and must still look like the entry
+    /// the retry created: of the requested type, owned by the daemon, and (unless it is a symlink)
+    /// without permission bits.
+    /// Every following operation goes through that fd, so a concurrent rename cannot redirect them
+    /// to a different entry, and in particular not through a symlink.
+    fn fix_up_fallback_entry(
+        &self,
+        ctx: &Context,
+        extensions: &Extensions,
+        parent_file: &InodeFile,
+        name: &CStr,
+        created: Option<RawFd>,
+        mode: libc::mode_t,
+    ) -> io::Result<()> {
+        let file_type = mode & libc::S_IFMT;
+        let mut opened = None;
+        let (fd, o_path) = match created {
+            Some(fd) => (fd, false),
+            None => {
+                // Safe because this is always successful.
+                let daemon_uid = unsafe { libc::geteuid() };
+                let file = self
+                    .open_relative_to(parent_file, name, libc::O_PATH, None)
+                    // Safe because we just opened this fd.
+                    .map(|fd| unsafe { File::from_raw_fd(fd) })
+                    .and_then(|file| Ok((statx(&file, None)?.st, file)));
+                match file {
+                    Ok((st, file))
+                        if st.st_mode & libc::S_IFMT == file_type
+                            && st.st_uid == daemon_uid
+                            && (file_type == libc::S_IFLNK
+                                || st.st_mode & 0o7777 & !libc::S_ISGID == 0) =>
+                    {
+                        (opened.insert(file).as_raw_fd(), true)
+                    }
+                    // `name` no longer refers to the entry we created, so leave it alone.
+                    res => {
+                        let err = res
+                            .err()
+                            .unwrap_or_else(|| io::Error::from_raw_os_error(libc::EIO));
+                        warn!("Lost track of {name:?} created with daemon credentials: {err}");
+                        return Err(err);
+                    }
+                }
+            }
+        };
+
+        if let Err(err) =
+            self.do_fix_up_fallback_entry(ctx, extensions, parent_file, &fd, o_path, mode)
+        {
+            warn!("Failed to set owner of {name:?} created with daemon credentials, removing it: {err}");
+            self.remove_fallback_entry(parent_file, name, &fd, file_type);
+            return Err(err);
+        }
+        Ok(())
+    }
+
+    fn do_fix_up_fallback_entry(
+        &self,
+        ctx: &Context,
+        extensions: &Extensions,
+        parent_file: &InodeFile,
+        file: &impl AsRawFd,
+        o_path: bool,
+        mode: libc::mode_t,
+    ) -> io::Result<()> {
+        let parent_st = statx(parent_file, None)?.st;
+        let uid = self.map_guest_uid(ctx.uid)?.into_inner();
+        let caller_gid = self.map_guest_gid(ctx.gid)?.into_inner();
+        let gid = fallback_entry_gid(caller_gid, parent_st.st_mode, parent_st.st_gid);
+
+        // Safe because this is a constant value and a valid C string.
+        let empty = unsafe { CStr::from_bytes_with_nul_unchecked(EMPTY_CSTR) };
+        // Safe because this doesn't modify any memory and we check the return value.
+        let res = unsafe {
+            libc::fchownat(
+                file.as_raw_fd(),
+                empty.as_ptr(),
+                uid,
+                gid,
+                libc::AT_EMPTY_PATH | libc::AT_SYMLINK_NOFOLLOW,
+            )
+        };
+        if res < 0 {
+            return Err(io::Error::last_os_error());
+        }
+
+        if mode & libc::S_IFMT == libc::S_IFLNK {
+            return Ok(());
+        }
+
+        // Without the supplementary group extension, `sup_gids` is empty, and like a create with
+        // the caller's credentials (see `unix_credentials_guard()`), only the caller's primary
+        // group counts.
+        let caller_in_parent_group = caller_gid == parent_st.st_gid
+            || extensions.sup_gids.iter().any(|gid| {
+                self.map_guest_gid(*gid)
+                    .is_ok_and(|gid| gid.into_inner() == parent_st.st_gid)
+            });
+        let mode = fallback_entry_mode(mode, parent_st.st_mode, caller_in_parent_group);
+
+        if o_path {
+            oslib::fchmodat(
+                self.proc_self_fd.as_raw_fd(),
+                format!("{}", file.as_raw_fd()),
+                mode,
+                0,
+            )
+        } else {
+            oslib::fchmod(file.as_raw_fd(), mode)
+        }
+    }
+
+    /// Removes the entry `fix_up_fallback_entry()` failed to fix up, if `name` still refers to it.
+    fn remove_fallback_entry(
+        &self,
+        parent_file: &InodeFile,
+        name: &CStr,
+        file: &impl AsRawFd,
+        file_type: libc::mode_t,
+    ) {
+        let same_entry = match (statx(file, None), statx(parent_file, Some(name))) {
+            (Ok(created), Ok(current)) => {
+                created.st.st_dev == current.st.st_dev && created.st.st_ino == current.st.st_ino
+            }
+            _ => false,
+        };
+        if !same_entry {
+            warn!("Not removing {name:?}, it no longer refers to the entry created with daemon credentials");
+            return;
+        }
+
+        let flags = if file_type == libc::S_IFDIR {
+            libc::AT_REMOVEDIR
+        } else {
+            0
+        };
+        // Safe because this doesn't modify any memory.
+        unsafe { libc::unlinkat(parent_file.as_raw_fd(), name.as_ptr(), flags) };
+    }
+
     #[allow(clippy::too_many_arguments)]
     fn do_create(
         &self,
@@ -1231,22 +1548,38 @@ impl PassthroughFs {
         umask: u32,
         extensions: Extensions,
     ) -> io::Result<RawFd> {
-        let fd = {
-            let _credentials_guard = self.unix_credentials_guard(ctx, &extensions)?;
-            let _umask_guard = self
-                .posix_acl
-                .load(Ordering::Relaxed)
-                .then(|| oslib::ScopedUmask::new(umask));
+        let (fd, used_daemon_creds) =
+            self.create_or_retry_as_daemon(ctx, &extensions, parent_file, name, |mode_mask| {
+                let _umask_guard = self
+                    .posix_acl
+                    .load(Ordering::Relaxed)
+                    .then(|| oslib::ScopedUmask::new(umask));
 
-            // Add libc:O_EXCL to ensure we're not accidentally opening a file the guest wouldn't
-            // be allowed to access otherwise.
-            self.open_relative_to(
+                // Add libc:O_EXCL to ensure we're not accidentally opening a file the guest wouldn't
+                // be allowed to access otherwise.
+                self.open_relative_to(
+                    parent_file,
+                    name,
+                    flags as i32 | libc::O_CREAT | libc::O_EXCL,
+                    Some(mode & mode_mask),
+                )
+            })?;
+
+        if used_daemon_creds {
+            if let Err(e) = self.fix_up_fallback_entry(
+                ctx,
+                &extensions,
                 parent_file,
                 name,
-                flags as i32 | libc::O_CREAT | libc::O_EXCL,
-                mode.into(),
-            )?
-        };
+                Some(fd),
+                libc::S_IFREG | (mode & !umask & 0o7777),
+            ) {
+                unsafe {
+                    libc::close(fd);
+                }
+                return Err(e);
+            }
+        }
 
         // Set security context
         if let Some(secctx) = extensions.secctx {
@@ -1724,21 +2057,31 @@ impl FileSystem for PassthroughFs {
         let parent_file = data.get_file()?;
 
         let invalidated_inode = self.before_invalidating_path(&data, name);
-        let res = {
-            let _credentials_guard = self.unix_credentials_guard(&ctx, &extensions)?;
-            let _umask_guard = self
-                .posix_acl
-                .load(Ordering::Relaxed)
-                .then(|| oslib::ScopedUmask::new(umask));
+        let result =
+            self.create_or_retry_as_daemon(&ctx, &extensions, &parent_file, name, |mode_mask| {
+                let _umask_guard = self
+                    .posix_acl
+                    .load(Ordering::Relaxed)
+                    .then(|| oslib::ScopedUmask::new(umask));
 
-            // Safe because this doesn't modify any memory and we check the return value.
-            unsafe { libc::mkdirat(parent_file.as_raw_fd(), name.as_ptr(), mode) }
-        };
+                // Safe because this doesn't modify any memory and we check the return value.
+                let res = unsafe {
+                    libc::mkdirat(parent_file.as_raw_fd(), name.as_ptr(), mode & mode_mask)
+                };
+                if res < 0 {
+                    Err(io::Error::last_os_error())
+                } else {
+                    Ok(())
+                }
+            });
         if let Some(invalidated_inode) = invalidated_inode {
             self.after_invalidating_path(invalidated_inode, "Overwrote (via mkdir)");
         }
-        if res < 0 {
-            return Err(io::Error::last_os_error());
+        let (_, used_daemon_creds) = result?;
+
+        if used_daemon_creds {
+            let mode = libc::S_IFDIR | (mode & !umask & 0o7777);
+            self.fix_up_fallback_entry(&ctx, &extensions, &parent_file, name, None, mode)?;
         }
 
         // Set security context on dir.
@@ -2171,29 +2514,41 @@ impl FileSystem for PassthroughFs {
         let parent_file = data.get_file()?;
 
         let invalidated_inode = self.before_invalidating_path(&data, name);
-        let res = {
-            let _credentials_guard = self.unix_credentials_guard(&ctx, &extensions)?;
-            let _umask_guard = self
-                .posix_acl
-                .load(Ordering::Relaxed)
-                .then(|| oslib::ScopedUmask::new(umask));
+        let result =
+            self.create_or_retry_as_daemon(&ctx, &extensions, &parent_file, name, |mode_mask| {
+                let _umask_guard = self
+                    .posix_acl
+                    .load(Ordering::Relaxed)
+                    .then(|| oslib::ScopedUmask::new(umask));
 
-            // Safe because this doesn't modify any memory and we check the return value.
-            unsafe {
-                libc::mknodat(
-                    parent_file.as_raw_fd(),
-                    name.as_ptr(),
-                    mode as libc::mode_t,
-                    u64::from(rdev),
-                )
-            }
-        };
+                // Safe because this doesn't modify any memory and we check the return value.
+                let res = unsafe {
+                    libc::mknodat(
+                        parent_file.as_raw_fd(),
+                        name.as_ptr(),
+                        mode as libc::mode_t & mode_mask,
+                        u64::from(rdev),
+                    )
+                };
+                if res < 0 {
+                    Err(io::Error::last_os_error())
+                } else {
+                    Ok(())
+                }
+            });
         if let Some(invalidated_inode) = invalidated_inode {
             self.after_invalidating_path(invalidated_inode, "Overwrote (via mknod)");
         }
+        let (_, used_daemon_creds) = result?;
 
-        if res < 0 {
-            return Err(io::Error::last_os_error());
+        if used_daemon_creds {
+            // A zero file type means a regular file, like for mknod(2).
+            let file_type = match mode & libc::S_IFMT {
+                0 => libc::S_IFREG,
+                file_type => file_type,
+            };
+            let mode = file_type | (mode & !umask & 0o7777);
+            self.fix_up_fallback_entry(&ctx, &extensions, &parent_file, name, None, mode)?;
         }
 
         // Set security context on node.
@@ -2257,18 +2612,24 @@ impl FileSystem for PassthroughFs {
         let parent_file = data.get_file()?;
 
         let invalidated_inode = self.before_invalidating_path(&data, name);
-        let res = {
-            let _credentials_guard = self.unix_credentials_guard(&ctx, &extensions)?;
-
+        let result = self.create_or_retry_as_daemon(&ctx, &extensions, &parent_file, name, |_| {
             // Safe because this doesn't modify any memory and we check the return value.
-            unsafe { libc::symlinkat(linkname.as_ptr(), parent_file.as_raw_fd(), name.as_ptr()) }
-        };
+            let res = unsafe {
+                libc::symlinkat(linkname.as_ptr(), parent_file.as_raw_fd(), name.as_ptr())
+            };
+            if res < 0 {
+                Err(io::Error::last_os_error())
+            } else {
+                Ok(())
+            }
+        });
         if let Some(invalidated_inode) = invalidated_inode {
             self.after_invalidating_path(invalidated_inode, "Overwrote (via symlink)");
         }
+        let (_, used_daemon_creds) = result?;
 
-        if res < 0 {
-            return Err(io::Error::last_os_error());
+        if used_daemon_creds {
+            self.fix_up_fallback_entry(&ctx, &extensions, &parent_file, name, None, libc::S_IFLNK)?;
         }
 
         // Set security context on symlink.
@@ -2781,6 +3142,7 @@ impl From<GuestFile> for HandleDataFile {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::convert::TryFrom;
 
     #[test]
     fn setxattr_non_utf8_name_does_not_clear_sgid() {
@@ -2802,5 +3164,230 @@ mod tests {
             SetxattrFlags::SETXATTR_ACL_KILL_SGID,
             name,
         ));
+    }
+
+    #[test]
+    fn remapped_posix_acl_access_xattr_requires_renaming_map() {
+        let map = |s: &str| XattrMap::try_from(s).unwrap();
+
+        assert_eq!(remapped_posix_acl_access_xattr(None), None);
+        assert_eq!(
+            remapped_posix_acl_access_xattr(Some(&map(":map::user.virtiofs.:"))).as_deref(),
+            Some(CStr::from_bytes_with_nul(b"user.virtiofs.system.posix_acl_access\0").unwrap())
+        );
+        // Passed through unchanged: the host filesystem enforces the ACL itself.
+        assert_eq!(
+            remapped_posix_acl_access_xattr(Some(&map(":map:trusted.:user.virtiofs.:"))),
+            None
+        );
+        // Rejected: there is no stored ACL to account for.
+        assert_eq!(
+            remapped_posix_acl_access_xattr(Some(&map(":bad:all:system.:::ok:all:::"))),
+            None
+        );
+        assert_eq!(
+            remapped_posix_acl_access_xattr(Some(&map(
+                ":unsupported:all:system.posix_acl:::map::user.virtiofs.:"
+            ))),
+            None
+        );
+    }
+
+    #[test]
+    fn fallback_entry_gid_follows_sgid_parent() {
+        assert_eq!(fallback_entry_gid(1000, 0o755, 2000), 1000);
+        assert_eq!(fallback_entry_gid(1000, 0o2755, 2000), 2000);
+    }
+
+    #[test]
+    fn fallback_entry_mode_matches_create_with_caller_credentials() {
+        let file = libc::S_IFREG;
+        let dir = libc::S_IFDIR;
+
+        // S_ISGID kept: no S_ISGID parent, caller in the parent's group, or no group exec.
+        assert_eq!(fallback_entry_mode(file | 0o2775, 0o775, false), 0o2775);
+        assert_eq!(fallback_entry_mode(file | 0o2775, 0o2775, true), 0o2775);
+        assert_eq!(fallback_entry_mode(file | 0o2765, 0o2775, false), 0o2765);
+        // S_ISGID stripped: executable file in an S_ISGID parent of a group the caller isn't in.
+        assert_eq!(fallback_entry_mode(file | 0o6775, 0o2775, false), 0o4775);
+        // S_ISUID is kept on files.
+        assert_eq!(fallback_entry_mode(file | 0o4644, 0o2775, false), 0o4644);
+        // Directories: no S_ISUID, and S_ISGID only from the parent.
+        assert_eq!(fallback_entry_mode(dir | 0o775, 0o2775, false), 0o2775);
+        assert_eq!(fallback_entry_mode(dir | 0o6775, 0o775, false), 0o775);
+        assert_eq!(fallback_entry_mode(dir | 0o1777, 0o775, false), 0o1777);
+    }
+
+    /// Exercises `posix_acl_create_fallback` end to end on the host filesystem holding the
+    /// temporary directory, which must support `user.` xattrs.  Needs root, to switch credentials,
+    /// and is skipped otherwise.
+    #[test]
+    fn posix_acl_create_fallback_end_to_end() {
+        use std::os::unix::ffi::OsStrExt;
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+
+        // Safe because this is always successful.
+        if unsafe { libc::geteuid() } != 0 {
+            eprintln!("Skipping posix_acl_create_fallback_end_to_end: requires root");
+            return;
+        }
+
+        let cstr = |s: &str| CString::new(s).unwrap();
+        let root =
+            std::env::temp_dir().join(format!("virtiofsd-acl-fallback-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir(&root).unwrap();
+        // Only root can create entries in these, but `acl` has a (remapped, opaque) ACL.
+        for dir in ["acl", "noacl", "acl-sgid"] {
+            std::fs::create_dir(root.join(dir)).unwrap();
+        }
+        std::fs::set_permissions(root.join("acl"), PermissionsExt::from_mode(0o755)).unwrap();
+        std::fs::set_permissions(root.join("noacl"), PermissionsExt::from_mode(0o755)).unwrap();
+        std::os::unix::fs::chown(root.join("acl-sgid"), None, Some(2000)).unwrap();
+        std::fs::set_permissions(root.join("acl-sgid"), PermissionsExt::from_mode(0o2755)).unwrap();
+        for dir in ["acl", "acl-sgid"] {
+            let path = CString::new(root.join(dir).as_os_str().as_bytes()).unwrap();
+            let name = cstr("user.virtiofs.system.posix_acl_access");
+            let value = b"opaque";
+            let res = unsafe {
+                libc::setxattr(
+                    path.as_ptr(),
+                    name.as_ptr(),
+                    value.as_ptr().cast(),
+                    value.len(),
+                    0,
+                )
+            };
+            assert_eq!(res, 0, "setxattr: {}", io::Error::last_os_error());
+        }
+
+        let fs = PassthroughFs::new(Config {
+            root_dir: root.to_str().unwrap().to_string(),
+            xattr: true,
+            posix_acl: NegotiationMode::Always,
+            xattrmap: Some(XattrMap::try_from(":map::user.virtiofs.:").unwrap()),
+            posix_acl_create_fallback: true,
+            ..Default::default()
+        })
+        .unwrap();
+        // Negotiate the supplementary group extension so the daemon does not keep
+        // CAP_DAC_OVERRIDE for the first, caller-credential attempt.
+        fs.init(
+            FsOptions::POSIX_ACL
+                | FsOptions::DONT_MASK
+                | FsOptions::SETXATTR_EXT
+                | FsOptions::CREATE_SUPP_GROUP,
+        )
+        .unwrap();
+
+        let ctx = || Context {
+            uid: GuestUid::from(1000),
+            gid: GuestGid::from(1000),
+            pid: 0,
+        };
+        let lookup = |name: &str| fs.lookup(ctx(), fuse::ROOT_ID, &cstr(name)).unwrap().inode;
+        let meta = |path: &str| std::fs::symlink_metadata(root.join(path)).unwrap();
+        let (acl, noacl, acl_sgid) = (lookup("acl"), lookup("noacl"), lookup("acl-sgid"));
+
+        fs.mkdir(
+            ctx(),
+            acl,
+            &cstr("dir"),
+            0o777,
+            0o022,
+            Extensions::default(),
+        )
+        .unwrap();
+        let (entry, handle, _) = fs
+            .create(
+                ctx(),
+                acl,
+                &cstr("file"),
+                libc::S_IFREG | 0o4644,
+                false,
+                libc::O_RDWR as u32,
+                0o022,
+                Extensions::default(),
+            )
+            .unwrap();
+        fs.release(ctx(), entry.inode, 0, handle.unwrap(), false, false, None)
+            .unwrap();
+        fs.mknod(
+            ctx(),
+            acl,
+            &cstr("fifo"),
+            libc::S_IFIFO | 0o666,
+            0,
+            0o022,
+            Extensions::default(),
+        )
+        .unwrap();
+        fs.symlink(
+            ctx(),
+            &cstr("file"),
+            acl,
+            &cstr("link"),
+            Extensions::default(),
+        )
+        .unwrap();
+        for (path, mode) in [
+            ("acl/dir", libc::S_IFDIR | 0o755),
+            ("acl/file", libc::S_IFREG | 0o4644),
+            ("acl/fifo", libc::S_IFIFO | 0o644),
+        ] {
+            let m = meta(path);
+            assert_eq!((m.uid(), m.gid(), m.mode()), (1000, 1000, mode), "{path}");
+        }
+        let m = meta("acl/link");
+        assert_eq!((m.uid(), m.gid()), (1000, 1000));
+        assert!(m.file_type().is_symlink());
+
+        // S_ISGID parent: the group is inherited, and S_ISGID is stripped from an executable
+        // file of a group the caller isn't in, but not from a directory.
+        fs.mkdir(
+            ctx(),
+            acl_sgid,
+            &cstr("dir"),
+            0o775,
+            0,
+            Extensions::default(),
+        )
+        .unwrap();
+        fs.mknod(
+            ctx(),
+            acl_sgid,
+            &cstr("file"),
+            libc::S_IFREG | 0o2775,
+            0,
+            0,
+            Extensions::default(),
+        )
+        .unwrap();
+        let m = meta("acl-sgid/dir");
+        assert_eq!(
+            (m.uid(), m.gid(), m.mode()),
+            (1000, 2000, libc::S_IFDIR | 0o2775)
+        );
+        let m = meta("acl-sgid/file");
+        assert_eq!(
+            (m.uid(), m.gid(), m.mode()),
+            (1000, 2000, libc::S_IFREG | 0o775)
+        );
+
+        // No ACL on the parent: the host's verdict stands.
+        let err = fs
+            .mkdir(
+                ctx(),
+                noacl,
+                &cstr("dir"),
+                0o755,
+                0o022,
+                Extensions::default(),
+            )
+            .err()
+            .unwrap();
+        assert_eq!(err.raw_os_error(), Some(libc::EACCES));
+
+        std::fs::remove_dir_all(&root).unwrap();
     }
 }

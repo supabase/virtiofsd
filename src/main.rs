@@ -223,6 +223,13 @@ struct Opt {
     #[arg(long)]
     no_readdirplus: bool,
 
+    /// If the host filesystem denies a create with the caller's credentials, retry it with the
+    /// daemon's credentials, if the parent directory has a POSIX ACL that --xattrmap stores as an
+    /// opaque xattr (requires --posix-acl and an --xattrmap that renames
+    /// system.posix_acl_access)
+    #[arg(long)]
+    posix_acl_create_fallback: bool,
+
     /// Enable writeback cache
     #[arg(long)]
     writeback: bool,
@@ -853,6 +860,7 @@ fn main() {
         readdirplus,
         writeback: opt.writeback,
         allow_direct_io: opt.allow_direct_io,
+        posix_acl_create_fallback: opt.posix_acl_create_fallback,
         killpriv_v2,
         security_label: opt.security_label,
         posix_acl: opt.posix_acl,

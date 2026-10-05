@@ -92,6 +92,22 @@ Please note that when the `security.capability` xattr is remapped, the daemon ha
 extra work to remove it during many operations, which the host kernel normally
 does itself.
 
+## POSIX ACLs
+
+With `--posix-acl`, the guest kernel enforces POSIX ACLs itself, and virtiofsd stores
+them in the `system.posix_acl_access` and `system.posix_acl_default` xattrs.  If the
+host file system does not support POSIX ACLs (e.g. NFSv4), these can be remapped like
+any other xattr, e.g. with `--xattrmap=":map::user.virtiofs.:"`.  The host file
+system then stores guest ACLs as opaque xattrs, and does not enforce them, which
+has two consequences:
+
+- The host file system denies creating entries that only a guest ACL allows,
+  because virtiofsd creates entries with the caller's credentials.
+  `--posix-acl-create-fallback` makes virtiofsd retry these creates with its own
+  credentials, if the parent directory has a remapped access ACL.
+- The host file system does not apply default ACLs (`system.posix_acl_default`) to
+  new entries.
+
 ## Security considerations
 
 Operating systems typically partition the xattr namespace using
