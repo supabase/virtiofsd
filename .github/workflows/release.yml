@@ -1,0 +1,63 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: write
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  release:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Check version tag
+        env:
+          TAG: ${{ github.ref_name }}
+        run: |
+          package_version=$(sed -n 's/^version = "\([^"]*\)"/\1/p' Cargo.toml | head -n 1)
+          if [ "$TAG" != "v$package_version" ]; then
+            echo "Tag $TAG does not match Cargo.toml version $package_version" >&2
+            exit 1
+          fi
+
+      - name: Build static Linux binary
+        run: |
+          docker run --rm --platform linux/amd64 \
+            -v "$GITHUB_WORKSPACE:/src" -w /src rust:alpine sh -euxc '
+              apk add --no-cache libcap-ng-static libseccomp-static musl-dev
+              RUSTFLAGS="-C target-feature=+crt-static -C link-self-contained=yes" \
+                LIBSECCOMP_LINK_TYPE=static LIBSECCOMP_LIB_PATH=/usr/lib \
+                LIBCAPNG_LINK_TYPE=static LIBCAPNG_LIB_PATH=/usr/lib \
+                cargo build --locked --release --target x86_64-unknown-linux-musl
+            '
+
+      - name: Package release assets
+        env:
+          TAG: ${{ github.ref_name }}
+        run: |
+          archive="virtiofsd-${TAG}-x86_64-linux-musl.tar.gz"
+          mkdir -p dist
+          tar -czf "dist/$archive" \
+            -C target/x86_64-unknown-linux-musl/release virtiofsd \
+            -C "$GITHUB_WORKSPACE" LICENSE-APACHE LICENSE-BSD-3-Clause
+          (cd dist && sha256sum "$archive" > SHA256SUMS)
+
+      - name: Publish GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          TAG: ${{ github.ref_name }}
+        run: |
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            gh release upload "$TAG" dist/* --clobber
+          else
+            gh release create "$TAG" dist/* --verify-tag --generate-notes
+          fi
