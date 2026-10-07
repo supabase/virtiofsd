@@ -35,16 +35,17 @@ After installing Rust, you can compile it to a binary by running:
 cargo build --release
 ```
 
-## CI-built binaries
+## Release binaries
 
-Every time new code is merged, the CI pipeline will upload a debug binary
-of virtiofsd. It is intended to be an accessible way for anyone to
-download and test virtiofsd without needing a Rust toolchain installed.
+Version tags pushed to the [Supabase GitHub fork](https://github.com/supabase/virtiofsd)
+create [GitHub Releases](https://github.com/supabase/virtiofsd/releases) with a
+statically linked `x86_64` Linux binary and a SHA-256 checksum. Download the
+archive for the desired version, then extract `virtiofsd` from it.
 
-The debug binary is built only for x86\_64 Linux-based systems.
-
-[Click here to download the latest build](
-https://gitlab.com/virtio-fs/virtiofsd/-/jobs/artifacts/main/download?job=publish)
+To publish a release, update the version in `Cargo.toml`, merge the change to
+`main`, then push a matching tag such as `v1.14.1` to the `fork` remote. The
+release workflow builds the tagged commit and publishes the archive once the
+build succeeds.
 
 ## Contributing
 See [CONTRIBUTING.md](CONTRIBUTING.md)
