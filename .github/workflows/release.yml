@@ -6,15 +6,27 @@ on:
       - 'v*'
 
 permissions:
-  contents: write
+  contents: read
 
 concurrency:
   group: release-${{ github.ref }}
   cancel-in-progress: false
 
 jobs:
-  release:
-    runs-on: ubuntu-24.04
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: ubuntu-24.04
+            platform: linux/amd64
+            target: x86_64-unknown-linux-musl
+            asset_arch: x86_64
+          - runner: ubuntu-24.04-arm
+            platform: linux/arm64
+            target: aarch64-unknown-linux-musl
+            asset_arch: aarch64
+    runs-on: ${{ matrix.runner }}
     steps:
       - uses: actions/checkout@v4
 
@@ -29,26 +41,57 @@ jobs:
           fi
 
       - name: Build static Linux binary
+        env:
+          PLATFORM: ${{ matrix.platform }}
+          TARGET: ${{ matrix.target }}
         run: |
-          docker run --rm --platform linux/amd64 \
-            -v "$GITHUB_WORKSPACE:/src" -w /src rust:alpine sh -euxc '
+          docker run --rm --platform "$PLATFORM" \
+            -v "$GITHUB_WORKSPACE:/src" -w /src -e TARGET rust:alpine sh -euxc '
               apk add --no-cache libcap-ng-static libseccomp-static musl-dev
               RUSTFLAGS="-C target-feature=+crt-static -C link-self-contained=yes" \
                 LIBSECCOMP_LINK_TYPE=static LIBSECCOMP_LIB_PATH=/usr/lib \
                 LIBCAPNG_LINK_TYPE=static LIBCAPNG_LIB_PATH=/usr/lib \
-                cargo build --locked --release --target x86_64-unknown-linux-musl
+                cargo build --locked --release --target "$TARGET"
             '
 
-      - name: Package release assets
+      - name: Package release asset
+        env:
+          TAG: ${{ github.ref_name }}
+          TARGET: ${{ matrix.target }}
+          ASSET_ARCH: ${{ matrix.asset_arch }}
+        run: |
+          archive="virtiofsd-${TAG}-${ASSET_ARCH}-linux-musl.tar.gz"
+          mkdir -p dist
+          tar -czf "dist/$archive" \
+            -C "target/$TARGET/release" virtiofsd \
+            -C "$GITHUB_WORKSPACE" LICENSE-APACHE LICENSE-BSD-3-Clause
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: release-${{ matrix.asset_arch }}
+          path: dist/*.tar.gz
+          if-no-files-found: error
+          compression-level: 0
+
+  release:
+    needs: build
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: release-*
+          path: dist
+          merge-multiple: true
+
+      - name: Prepare checksums
         env:
           TAG: ${{ github.ref_name }}
         run: |
-          archive="virtiofsd-${TAG}-x86_64-linux-musl.tar.gz"
-          mkdir -p dist
-          tar -czf "dist/$archive" \
-            -C target/x86_64-unknown-linux-musl/release virtiofsd \
-            -C "$GITHUB_WORKSPACE" LICENSE-APACHE LICENSE-BSD-3-Clause
-          (cd dist && sha256sum "$archive" > SHA256SUMS)
+          test -f "dist/virtiofsd-${TAG}-x86_64-linux-musl.tar.gz"
+          test -f "dist/virtiofsd-${TAG}-aarch64-linux-musl.tar.gz"
+          (cd dist && sha256sum *.tar.gz > SHA256SUMS)
 
       - name: Publish GitHub release
         env:

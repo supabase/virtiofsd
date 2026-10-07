@@ -38,9 +38,10 @@ cargo build --release
 ## Release binaries
 
 Version tags pushed to the [Supabase GitHub fork](https://github.com/supabase/virtiofsd)
-create [GitHub Releases](https://github.com/supabase/virtiofsd/releases) with a
-statically linked `x86_64` Linux binary and a SHA-256 checksum. Download the
-archive for the desired version, then extract `virtiofsd` from it.
+create [GitHub Releases](https://github.com/supabase/virtiofsd/releases) with
+statically linked Linux binaries for `x86_64` and `aarch64` (ARM64), plus a
+SHA-256 checksum file. Download the archive for your architecture, then
+extract `virtiofsd` from it.
 
 To publish a release, update the version in `Cargo.toml`, merge the change to
 `main`, then push a matching tag such as `v1.14.1` to the `fork` remote. The
