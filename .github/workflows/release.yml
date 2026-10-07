@@ -4,12 +4,18 @@ on:
   push:
     tags:
       - 'v*'
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Existing v* tag to release
+        required: true
+        type: string
 
 permissions:
   contents: read
 
 concurrency:
-  group: release-${{ github.ref }}
+  group: release-${{ inputs.tag || github.ref_name }}
   cancel-in-progress: false
 
 jobs:
@@ -29,14 +35,15 @@ jobs:
     runs-on: ${{ matrix.runner }}
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: refs/tags/${{ inputs.tag || github.ref_name }}
 
-      - name: Check version tag
+      - name: Validate release tag
         env:
-          TAG: ${{ github.ref_name }}
+          TAG: ${{ inputs.tag || github.ref_name }}
         run: |
-          package_version=$(sed -n 's/^version = "\([^"]*\)"/\1/p' Cargo.toml | head -n 1)
-          if [ "$TAG" != "v$package_version" ]; then
-            echo "Tag $TAG does not match Cargo.toml version $package_version" >&2
+          if [[ "$TAG" != v* ]]; then
+            echo "Release tag must start with v: $TAG" >&2
             exit 1
           fi
 
@@ -56,7 +63,7 @@ jobs:
 
       - name: Package release asset
         env:
-          TAG: ${{ github.ref_name }}
+          TAG: ${{ inputs.tag || github.ref_name }}
           TARGET: ${{ matrix.target }}
           ASSET_ARCH: ${{ matrix.asset_arch }}
         run: |
@@ -87,7 +94,7 @@ jobs:
 
       - name: Prepare checksums
         env:
-          TAG: ${{ github.ref_name }}
+          TAG: ${{ inputs.tag || github.ref_name }}
         run: |
           test -f "dist/virtiofsd-${TAG}-x86_64-linux-musl.tar.gz"
           test -f "dist/virtiofsd-${TAG}-aarch64-linux-musl.tar.gz"
@@ -97,7 +104,7 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
           GH_REPO: ${{ github.repository }}
-          TAG: ${{ github.ref_name }}
+          TAG: ${{ inputs.tag || github.ref_name }}
         run: |
           if gh release view "$TAG" >/dev/null 2>&1; then
             gh release upload "$TAG" dist/* --clobber

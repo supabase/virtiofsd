@@ -43,10 +43,12 @@ statically linked Linux binaries for `x86_64` and `aarch64` (ARM64), plus a
 SHA-256 checksum file. Download the archive for your architecture, then
 extract `virtiofsd` from it.
 
-To publish a release, update the version in `Cargo.toml`, merge the change to
-`main`, then push a matching tag such as `v1.14.1` to the `fork` remote. The
-release workflow builds the tagged commit and publishes the archive once the
-build succeeds.
+To publish a release, push a `v*` tag for the desired commit to the `fork`
+remote. The tag names the release and does not need to match the version in
+`Cargo.toml`. Update `Cargo.toml` as well if you want `virtiofsd --version` to
+match the release tag. The workflow builds the tagged commit and publishes the
+archives once both builds succeed. To retry an existing tag, run the Release
+workflow manually and enter that tag.
 
 ## Contributing
 See [CONTRIBUTING.md](CONTRIBUTING.md)
