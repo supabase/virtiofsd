@@ -223,9 +223,9 @@ struct Opt {
     #[arg(long)]
     no_readdirplus: bool,
 
-    /// If the host filesystem denies a create with the caller's credentials, retry it with the
-    /// daemon's credentials, if the parent directory has a POSIX ACL that --xattrmap stores as an
-    /// opaque xattr (requires --posix-acl and an --xattrmap that renames
+    /// If the host filesystem denies a create with the caller's credentials, retry it (except for
+    /// device nodes) with the daemon's credentials, if the parent directory has a POSIX ACL that
+    /// --xattrmap stores as an opaque xattr (requires --posix-acl and an --xattrmap that renames
     /// system.posix_acl_access)
     #[arg(long)]
     posix_acl_create_fallback: bool,

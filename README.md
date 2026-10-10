@@ -163,10 +163,11 @@ defaults to `always`.
 --posix-acl-create-fallback
 ```
 If the host file system denies a create with the caller's credentials, retry it
-with the daemon's credentials, if the parent directory has a POSIX ACL that
-`--xattrmap` stores as an opaque xattr.  The new entry is then given the owner, group and mode it would have had if the
-caller had created it.  This relies on the guest kernel's permission checks, which
-have already allowed the create.
+(except for device nodes) with the daemon's credentials, if the parent directory
+has a POSIX ACL that `--xattrmap` stores as an opaque xattr.  The new entry is
+then given the owner, group and mode it would have had if the caller had created
+it.  This relies on the guest kernel's permission checks, which have already
+allowed the create.
 Requires `--posix-acl` and an `--xattrmap` that renames `system.posix_acl_access`.
 See [Extended attribute mapping](doc/xattr-mapping.md#posix-acls).
 

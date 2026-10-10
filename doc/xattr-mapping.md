@@ -103,8 +103,9 @@ has two consequences:
 
 - The host file system denies creating entries that only a guest ACL allows,
   because virtiofsd creates entries with the caller's credentials.
-  `--posix-acl-create-fallback` makes virtiofsd retry these creates with its own
-  credentials, if the parent directory has a remapped access ACL.
+  `--posix-acl-create-fallback` makes virtiofsd retry these creates (except for
+  device nodes) with its own credentials, if the parent directory has a remapped
+  access ACL.
 - The host file system does not apply default ACLs (`system.posix_acl_default`) to
   new entries.
 

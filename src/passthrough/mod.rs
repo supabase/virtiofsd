@@ -1321,6 +1321,8 @@ impl PassthroughFs {
     /// entry without any permission bits, so it is not accessible to anyone but the daemon until
     /// `fix_up_fallback_entry()` has given it its owner and mode.
     ///
+    /// `file_type` is the type of the entry `op` creates (`S_IFREG`, `S_IFDIR`, ...).
+    ///
     /// Returns `op`'s result, and whether it was the retry that succeeded.  In that case, the
     /// caller must call `fix_up_fallback_entry()` on the new entry.
     fn create_or_retry_as_daemon<T>(
@@ -1329,6 +1331,7 @@ impl PassthroughFs {
         extensions: &Extensions,
         parent_file: &InodeFile,
         name: &CStr,
+        file_type: libc::mode_t,
         op: impl Fn(libc::mode_t) -> io::Result<T>,
     ) -> io::Result<(T, bool)> {
         let guard = self.unix_credentials_guard(ctx, extensions)?;
@@ -1340,7 +1343,7 @@ impl PassthroughFs {
         // to read the parent's xattrs on the host either.
         drop(guard);
 
-        if !self.may_retry_create_as_daemon(ctx, parent_file, &err) {
+        if !self.may_retry_create_as_daemon(ctx, parent_file, file_type, &err) {
             return Err(err);
         }
         debug!(
@@ -1359,6 +1362,7 @@ impl PassthroughFs {
         &self,
         ctx: &Context,
         parent_file: &InodeFile,
+        file_type: libc::mode_t,
         err: &io::Error,
     ) -> bool {
         let acl_xattr = match &self.create_fallback_acl_xattr {
@@ -1371,6 +1375,10 @@ impl PassthroughFs {
             // `UnixCredentials::set()` keeps root's uid for root callers, so a retry would fail
             // just the same.
             && self.map_guest_uid(ctx.uid).is_ok_and(|uid| !uid.is_root())
+            // Device nodes also require `CAP_MKNOD`, which the caller's credentials never have on
+            // the host, but the daemon's do.
+            && file_type != libc::S_IFCHR
+            && file_type != libc::S_IFBLK
             && self.has_xattr(parent_file, acl_xattr)
     }
 
@@ -1548,8 +1556,13 @@ impl PassthroughFs {
         umask: u32,
         extensions: Extensions,
     ) -> io::Result<RawFd> {
-        let (fd, used_daemon_creds) =
-            self.create_or_retry_as_daemon(ctx, &extensions, parent_file, name, |mode_mask| {
+        let (fd, used_daemon_creds) = self.create_or_retry_as_daemon(
+            ctx,
+            &extensions,
+            parent_file,
+            name,
+            libc::S_IFREG,
+            |mode_mask| {
                 let _umask_guard = self
                     .posix_acl
                     .load(Ordering::Relaxed)
@@ -1563,7 +1576,8 @@ impl PassthroughFs {
                     flags as i32 | libc::O_CREAT | libc::O_EXCL,
                     Some(mode & mode_mask),
                 )
-            })?;
+            },
+        )?;
 
         if used_daemon_creds {
             if let Err(e) = self.fix_up_fallback_entry(
@@ -2057,8 +2071,13 @@ impl FileSystem for PassthroughFs {
         let parent_file = data.get_file()?;
 
         let invalidated_inode = self.before_invalidating_path(&data, name);
-        let result =
-            self.create_or_retry_as_daemon(&ctx, &extensions, &parent_file, name, |mode_mask| {
+        let result = self.create_or_retry_as_daemon(
+            &ctx,
+            &extensions,
+            &parent_file,
+            name,
+            libc::S_IFDIR,
+            |mode_mask| {
                 let _umask_guard = self
                     .posix_acl
                     .load(Ordering::Relaxed)
@@ -2073,7 +2092,8 @@ impl FileSystem for PassthroughFs {
                 } else {
                     Ok(())
                 }
-            });
+            },
+        );
         if let Some(invalidated_inode) = invalidated_inode {
             self.after_invalidating_path(invalidated_inode, "Overwrote (via mkdir)");
         }
@@ -2513,9 +2533,20 @@ impl FileSystem for PassthroughFs {
         let data = self.inodes.get(parent).ok_or_else(ebadf)?;
         let parent_file = data.get_file()?;
 
+        // A zero file type means a regular file, like for mknod(2).
+        let file_type = match mode & libc::S_IFMT {
+            0 => libc::S_IFREG,
+            file_type => file_type,
+        };
+
         let invalidated_inode = self.before_invalidating_path(&data, name);
-        let result =
-            self.create_or_retry_as_daemon(&ctx, &extensions, &parent_file, name, |mode_mask| {
+        let result = self.create_or_retry_as_daemon(
+            &ctx,
+            &extensions,
+            &parent_file,
+            name,
+            file_type,
+            |mode_mask| {
                 let _umask_guard = self
                     .posix_acl
                     .load(Ordering::Relaxed)
@@ -2535,18 +2566,14 @@ impl FileSystem for PassthroughFs {
                 } else {
                     Ok(())
                 }
-            });
+            },
+        );
         if let Some(invalidated_inode) = invalidated_inode {
             self.after_invalidating_path(invalidated_inode, "Overwrote (via mknod)");
         }
         let (_, used_daemon_creds) = result?;
 
         if used_daemon_creds {
-            // A zero file type means a regular file, like for mknod(2).
-            let file_type = match mode & libc::S_IFMT {
-                0 => libc::S_IFREG,
-                file_type => file_type,
-            };
             let mode = file_type | (mode & !umask & 0o7777);
             self.fix_up_fallback_entry(&ctx, &extensions, &parent_file, name, None, mode)?;
         }
@@ -2612,17 +2639,24 @@ impl FileSystem for PassthroughFs {
         let parent_file = data.get_file()?;
 
         let invalidated_inode = self.before_invalidating_path(&data, name);
-        let result = self.create_or_retry_as_daemon(&ctx, &extensions, &parent_file, name, |_| {
-            // Safe because this doesn't modify any memory and we check the return value.
-            let res = unsafe {
-                libc::symlinkat(linkname.as_ptr(), parent_file.as_raw_fd(), name.as_ptr())
-            };
-            if res < 0 {
-                Err(io::Error::last_os_error())
-            } else {
-                Ok(())
-            }
-        });
+        let result = self.create_or_retry_as_daemon(
+            &ctx,
+            &extensions,
+            &parent_file,
+            name,
+            libc::S_IFLNK,
+            |_| {
+                // Safe because this doesn't modify any memory and we check the return value.
+                let res = unsafe {
+                    libc::symlinkat(linkname.as_ptr(), parent_file.as_raw_fd(), name.as_ptr())
+                };
+                if res < 0 {
+                    Err(io::Error::last_os_error())
+                } else {
+                    Ok(())
+                }
+            },
+        );
         if let Some(invalidated_inode) = invalidated_inode {
             self.after_invalidating_path(invalidated_inode, "Overwrote (via symlink)");
         }
@@ -3341,6 +3375,24 @@ mod tests {
         let m = meta("acl/link");
         assert_eq!((m.uid(), m.gid()), (1000, 1000));
         assert!(m.file_type().is_symlink());
+
+        // Device nodes: the daemon has CAP_MKNOD, but the caller does not.
+        for (name, file_type) in [("chr", libc::S_IFCHR), ("blk", libc::S_IFBLK)] {
+            let err = fs
+                .mknod(
+                    ctx(),
+                    acl,
+                    &cstr(name),
+                    file_type | 0o666,
+                    libc::makedev(1, 3) as u32,
+                    0o022,
+                    Extensions::default(),
+                )
+                .err()
+                .unwrap();
+            assert_eq!(err.raw_os_error(), Some(libc::EACCES), "{name}");
+            assert!(std::fs::symlink_metadata(root.join("acl").join(name)).is_err());
+        }
 
         // S_ISGID parent: the group is inherited, and S_ISGID is stripped from an executable
         // file of a group the caller isn't in, but not from a directory.
