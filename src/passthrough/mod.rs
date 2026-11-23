@@ -121,6 +121,79 @@ fn fallback_entry_mode(
     }
 }
 
+const ACL_USER_OBJ: u16 = 0x01;
+const ACL_GROUP_OBJ: u16 = 0x04;
+const ACL_MASK: u16 = 0x10;
+const ACL_OTHER: u16 = 0x20;
+
+/// Returns the `(tag, perm)` of each entry of a POSIX ACL xattr value (`posix_acl_xattr_header`
+/// followed by `posix_acl_xattr_entry`s), or `None` if it is malformed.
+fn posix_acl_entries(value: &[u8]) -> Option<Vec<(u16, u16)>> {
+    let (entries, rest) = value.strip_prefix(&2u32.to_le_bytes())?.as_chunks::<8>();
+    if entries.is_empty() || !rest.is_empty() {
+        return None;
+    }
+    Some(
+        entries
+            .iter()
+            .map(|e| {
+                (
+                    u16::from_le_bytes([e[0], e[1]]),
+                    u16::from_le_bytes([e[2], e[3]]),
+                )
+            })
+            .collect(),
+    )
+}
+
+/// Computes the permission bits a POSIX access ACL implies, like `posix_acl_equiv_mode()`, and
+/// whether the ACL is fully described by them (and so need not be stored).
+fn posix_acl_mode(value: &[u8]) -> Option<(libc::mode_t, bool)> {
+    let mut mode = 0;
+    let mut group_obj = 0;
+    let mut mask = None;
+    let mut equiv = true;
+    for (tag, perm) in posix_acl_entries(value)? {
+        let perm = libc::mode_t::from(perm & 0o7);
+        match tag {
+            ACL_USER_OBJ => mode |= perm << 6,
+            ACL_GROUP_OBJ => group_obj = perm,
+            ACL_MASK => {
+                mask = Some(perm);
+                equiv = false;
+            }
+            ACL_OTHER => mode |= perm,
+            _ => equiv = false,
+        }
+    }
+    Some((mode | mask.unwrap_or(group_obj) << 3, equiv))
+}
+
+/// Updates a POSIX access ACL for a chmod to `mode`, like `__posix_acl_chmod()`: the owner, other,
+/// and the mask (or the owning group if there is no mask) entries get the new permission bits.
+/// Returns `None` if `value` is malformed.
+fn posix_acl_chmod(value: &[u8], mode: libc::mode_t) -> Option<Vec<u8>> {
+    let mask_tag = if posix_acl_entries(value)?
+        .iter()
+        .any(|&(tag, _)| tag == ACL_MASK)
+    {
+        ACL_MASK
+    } else {
+        ACL_GROUP_OBJ
+    };
+    let mut value = value.to_vec();
+    for e in value[4..].as_chunks_mut::<8>().0 {
+        let perm = match u16::from_le_bytes([e[0], e[1]]) {
+            ACL_USER_OBJ => mode >> 6,
+            ACL_OTHER => mode,
+            tag if tag == mask_tag => mode >> 3,
+            _ => continue,
+        };
+        e[2..4].copy_from_slice(&((perm & 0o7) as u16).to_le_bytes());
+    }
+    Some(value)
+}
+
 enum HandleDataFile {
     File(RwLock<GuestFile>),
     // `io::Error` does not implement `Clone`, so without wrapping it in `Arc`, returning the error
@@ -610,6 +683,11 @@ pub struct PassthroughFs {
     // enabled, `None` otherwise.
     create_fallback_acl_xattr: Option<CString>,
 
+    // Host name of the remapped `system.posix_acl_access` xattr if `posix_acl` is enabled, `None`
+    // otherwise.  The host filesystem does not tie such an xattr to the file mode, so we keep the
+    // two in sync ourselves.
+    remapped_acl_xattr: Option<CString>,
+
     // Whether we are preparing for migration and need to track changes to inodes like renames.  We
     // should then also make sure newly created inodes immediately have their migration info set.
     track_migration_info: AtomicBool,
@@ -689,6 +767,12 @@ impl PassthroughFs {
             None
         };
 
+        let remapped_acl_xattr = if cfg.posix_acl == NegotiationMode::Never {
+            None
+        } else {
+            remapped_posix_acl_access_xattr(cfg.xattrmap.as_ref())
+        };
+
         let mut fs = PassthroughFs {
             inodes: Default::default(),
             next_inode: AtomicU64::new(fuse::ROOT_ID + 1),
@@ -703,6 +787,7 @@ impl PassthroughFs {
             posix_acl: AtomicBool::new(false),
             sup_group_extension: AtomicBool::new(false),
             create_fallback_acl_xattr,
+            remapped_acl_xattr,
             os_facts: oslib::OsFacts::new(),
             track_migration_info: AtomicBool::new(false),
             cfg,
@@ -1396,6 +1481,125 @@ impl PassthroughFs {
         let res =
             unsafe { libc::getxattr(procname.as_ptr(), name.as_ptr(), std::ptr::null_mut(), 0) };
         res > 0
+    }
+
+    /// Reads xattr `name` (a host name) of `file` (possibly an `O_PATH` fd).  Returns `None` if
+    /// it has none.
+    fn get_xattr(&self, file: &impl AsRawFd, name: &CStr) -> io::Result<Option<Vec<u8>>> {
+        let procname = CString::new(format!("{}", file.as_raw_fd()))
+            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+        let _working_dir_guard = self.switch_to_proc_self_fd();
+
+        loop {
+            // Safe because this doesn't modify any memory: we only query the value's size.
+            let size = unsafe {
+                libc::getxattr(procname.as_ptr(), name.as_ptr(), std::ptr::null_mut(), 0)
+            };
+            if size >= 0 {
+                let mut buf = vec![0u8; size as usize];
+                // Safe because this writes at most `buf.len()` bytes to `buf`, and we check the
+                // return value.
+                let res = unsafe {
+                    libc::getxattr(
+                        procname.as_ptr(),
+                        name.as_ptr(),
+                        buf.as_mut_ptr() as *mut libc::c_void,
+                        buf.len(),
+                    )
+                };
+                if res >= 0 {
+                    buf.truncate(res as usize);
+                    return Ok(Some(buf));
+                }
+            }
+            let err = io::Error::last_os_error();
+            match err.raw_os_error() {
+                Some(libc::ENODATA) => return Ok(None),
+                // The value grew between the two calls.
+                Some(libc::ERANGE) => continue,
+                _ => return Err(err),
+            }
+        }
+    }
+
+    /// Gives `file` (possibly an `O_PATH` fd) the permission bits of the POSIX access ACL `value`
+    /// that was just stored as the remapped `acl_xattr`, like `posix_acl_update_mode()` does on a
+    /// native filesystem.  If the permission bits fully describe the ACL, it is removed again.
+    fn sync_mode_to_acl(
+        &self,
+        file: &impl AsRawFd,
+        acl_xattr: &CStr,
+        value: &[u8],
+    ) -> io::Result<()> {
+        let (perm, equiv) = match posix_acl_mode(value) {
+            Some(m) => m,
+            None => return Ok(()),
+        };
+        let st = statx(file, None)?.st;
+        oslib::fchmodat(
+            self.proc_self_fd.as_raw_fd(),
+            format!("{}", file.as_raw_fd()),
+            st.st_mode & 0o7000 | perm,
+            0,
+        )?;
+
+        if equiv {
+            let procname = CString::new(format!("{}", file.as_raw_fd()))
+                .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+            let _working_dir_guard = self.switch_to_proc_self_fd();
+            // Safe because this doesn't modify any memory and we check the return value.
+            if unsafe { libc::removexattr(procname.as_ptr(), acl_xattr.as_ptr()) } < 0 {
+                let err = io::Error::last_os_error();
+                if err.raw_os_error() != Some(libc::ENODATA) {
+                    return Err(err);
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Updates the remapped POSIX access ACL `acl_xattr` of `file` (possibly an `O_PATH` fd), if
+    /// it has one, for a chmod to `mode`, like `posix_acl_chmod()` does on a native filesystem.
+    fn sync_acl_to_mode(
+        &self,
+        file: &impl AsRawFd,
+        acl_xattr: &CStr,
+        mode: libc::mode_t,
+    ) -> io::Result<()> {
+        let value = match self.get_xattr(file, acl_xattr)? {
+            Some(value) => value,
+            None => return Ok(()),
+        };
+        let new_value = match posix_acl_chmod(&value, mode) {
+            Some(new_value) if new_value != value => new_value,
+            _ => return Ok(()),
+        };
+
+        let procname = CString::new(format!("{}", file.as_raw_fd()))
+            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+        let _working_dir_guard = self.switch_to_proc_self_fd();
+        // Safe because this doesn't modify any memory and we check the return value.
+        let res = unsafe {
+            libc::setxattr(
+                procname.as_ptr(),
+                acl_xattr.as_ptr(),
+                new_value.as_ptr() as *const libc::c_void,
+                new_value.len(),
+                libc::XATTR_REPLACE,
+            )
+        };
+        if res < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        Ok(())
+    }
+
+    /// Returns the remapped POSIX access ACL xattr name if POSIX ACLs have been negotiated and
+    /// `inode_data` can carry it.
+    fn remapped_acl_xattr(&self, inode_data: &InodeData) -> Option<&CStr> {
+        let acl_xattr = self.remapped_acl_xattr.as_deref()?;
+        (self.posix_acl.load(Ordering::Relaxed) && is_safe_inode(inode_data.mode))
+            .then_some(acl_xattr)
     }
 
     /// Gives an entry that `create_or_retry_as_daemon()` created with the daemon's credentials the
@@ -2371,6 +2575,10 @@ impl FileSystem for PassthroughFs {
             if res < 0 {
                 return Err(io::Error::last_os_error());
             }
+
+            if let Some(acl_xattr) = self.remapped_acl_xattr(&inode_data) {
+                self.sync_acl_to_mode(&inode_file, acl_xattr, attr.mode)?;
+            }
         }
 
         if valid.intersects(SetattrValid::UID | SetattrValid::GID) {
@@ -2888,10 +3096,15 @@ impl FileSystem for PassthroughFs {
                 )
             }
         };
-        if res == 0 {
-            Ok(())
-        } else {
-            Err(io::Error::last_os_error())
+        if res != 0 {
+            return Err(io::Error::last_os_error());
+        }
+
+        match self.remapped_acl_xattr(&data) {
+            Some(acl_xattr) if name.as_ref() == acl_xattr => {
+                self.sync_mode_to_acl(&data.get_file()?, acl_xattr, value)
+            }
+            _ => Ok(()),
         }
     }
 
@@ -3177,6 +3390,80 @@ impl From<GuestFile> for HandleDataFile {
 mod tests {
     use super::*;
     use std::convert::TryFrom;
+
+    fn acl(entries: &[(u16, u16, u32)]) -> Vec<u8> {
+        let mut value = 2u32.to_le_bytes().to_vec();
+        for &(tag, perm, id) in entries {
+            value.extend_from_slice(&tag.to_le_bytes());
+            value.extend_from_slice(&perm.to_le_bytes());
+            value.extend_from_slice(&id.to_le_bytes());
+        }
+        value
+    }
+
+    // What `sed -i` copies onto its temp file from a 0744 file without an ACL.
+    const SED_0744_ACL: &[u8] = &[
+        0x02, 0x00, 0x00, 0x00, 0x01, 0x00, 0x07, 0x00, 0xff, 0xff, 0xff, 0xff, 0x04, 0x00, 0x04,
+        0x00, 0xff, 0xff, 0xff, 0xff, 0x20, 0x00, 0x04, 0x00, 0xff, 0xff, 0xff, 0xff,
+    ];
+
+    #[test]
+    fn posix_acl_mode_of_minimal_acl() {
+        assert_eq!(posix_acl_mode(SED_0744_ACL), Some((0o744, true)));
+    }
+
+    #[test]
+    fn posix_acl_mode_uses_mask_for_group_bits() {
+        let value = acl(&[
+            (ACL_USER_OBJ, 6, u32::MAX),
+            (0x02, 7, 1004),
+            (ACL_GROUP_OBJ, 4, u32::MAX),
+            (ACL_MASK, 7, u32::MAX),
+            (ACL_OTHER, 0, u32::MAX),
+        ]);
+        assert_eq!(posix_acl_mode(&value), Some((0o670, false)));
+    }
+
+    #[test]
+    fn posix_acl_mode_rejects_malformed_values() {
+        assert_eq!(posix_acl_mode(&[]), None);
+        assert_eq!(posix_acl_mode(&2u32.to_le_bytes()), None);
+        assert_eq!(posix_acl_mode(&SED_0744_ACL[..27]), None);
+        assert_eq!(posix_acl_mode(&acl(&[(ACL_USER_OBJ, 7, 0)])[1..]), None);
+    }
+
+    #[test]
+    fn posix_acl_chmod_without_mask() {
+        assert_eq!(
+            posix_acl_chmod(SED_0744_ACL, 0o640).unwrap(),
+            acl(&[
+                (ACL_USER_OBJ, 6, u32::MAX),
+                (ACL_GROUP_OBJ, 4, u32::MAX),
+                (ACL_OTHER, 0, u32::MAX),
+            ])
+        );
+    }
+
+    #[test]
+    fn posix_acl_chmod_with_mask_keeps_group_obj() {
+        let value = acl(&[
+            (ACL_USER_OBJ, 7, u32::MAX),
+            (0x02, 7, 1004),
+            (ACL_GROUP_OBJ, 5, u32::MAX),
+            (ACL_MASK, 7, u32::MAX),
+            (ACL_OTHER, 5, u32::MAX),
+        ]);
+        assert_eq!(
+            posix_acl_chmod(&value, 0o600).unwrap(),
+            acl(&[
+                (ACL_USER_OBJ, 6, u32::MAX),
+                (0x02, 7, 1004),
+                (ACL_GROUP_OBJ, 5, u32::MAX),
+                (ACL_MASK, 0, u32::MAX),
+                (ACL_OTHER, 0, u32::MAX),
+            ])
+        );
+    }
 
     #[test]
     fn setxattr_non_utf8_name_does_not_clear_sgid() {
