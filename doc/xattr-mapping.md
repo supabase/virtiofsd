@@ -109,6 +109,17 @@ has two consequences:
 - The host file system does not apply default ACLs (`system.posix_acl_default`) to
   new entries.
 
+The host file system also no longer keeps a remapped access ACL and the file mode in
+sync, so virtiofsd does it instead: setting the ACL sets the mode, and a chmod updates
+the ACL.  This has two limits:
+
+- A lock in virtiofsd orders these updates only among requests to the same virtiofsd
+  process.  Other writers to the same files, such as another virtiofsd instance or
+  processes on the host, can still change the ACL and the mode independently.
+- virtiofsd writes the xattr and the mode one after the other.  If it is interrupted
+  in between, the two can stay out of sync, and an unprivileged virtiofsd can leave
+  the owner with temporary read and write permission.
+
 ## Security considerations
 
 Operating systems typically partition the xattr namespace using
